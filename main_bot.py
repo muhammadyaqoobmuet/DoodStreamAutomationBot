@@ -94,7 +94,7 @@ class AdvancedDoodStreamBot:
                 playwright_config = self.fingerprint_generator.generate_playwright_config(fingerprint)
 
                 browser = await p.chromium.launch(
-                    headless=True,
+                    headless=False,
                     proxy={'server': f'http://{proxy}'},
                     args=[
                         '--disable-blink-features=AutomationControlled',
@@ -154,21 +154,269 @@ class AdvancedDoodStreamBot:
                     self.proxy_pool.record_request(proxy, False, time.time() - start_time)
                     return False
 
-                # Step 6: Wait for player
+                # Handle age verification gate FIRST and FAST if present
                 try:
-                    await page.wait_for_selector('video', timeout=30000)
+                    clicked_age_gate = False
+                    # Race a few highly-specific selectors with short timeouts
+                    selectors = [
+                        "button:has-text(\"Yes, I'm 18+\")",
+                        "text=Yes, I'm 18+",
+                        "[role=button]:has-text(\"Yes, I'm 18+\")",
+                        "button.bg-green-600",
+                        "//button[normalize-space() = \"Yes, I'm 18+\"]",
+                    ]
+                    for sel in selectors:
+                        try:
+                            btn = page.locator(sel).first
+                            await btn.wait_for(state='visible', timeout=1200)
+                            print("🛡️ Age gate detected. Confirming 18+...")
+                            await btn.click(force=True)
+                            clicked_age_gate = True
+                            break
+                        except:
+                            continue
+
+                    if not clicked_age_gate:
+                        # Scoped modal search as fallback
+                        try:
+                            modal = page.locator('div:has(h3:has-text("Age Verification"))').first
+                            await modal.wait_for(state='visible', timeout=1500)
+                            inner_btn = modal.locator('button.bg-green-600, button:has-text("Yes, I\'m 18+"), [role="button"]:has-text("Yes, I\'m 18+")').first
+                            await inner_btn.wait_for(state='visible', timeout=800)
+                            print("🛡️ Age gate detected (modal). Confirming 18+...")
+                            await inner_btn.click(force=True)
+                            clicked_age_gate = True
+                        except:
+                            pass
+
+                    # Minimal wait only to allow overlay removal
+                    if clicked_age_gate:
+                        await page.wait_for_timeout(300)
+                except Exception as _:
+                    pass
+
+                # Step 6: Wait for player (handle iframe-based players)
+                try:
+                    # Ensure DOM is settled
+                    await page.wait_for_load_state('domcontentloaded')
+                    # Use a softer network idle for slow proxies; allow more time
+                    try:
+                        await page.wait_for_load_state('networkidle')
+                    except:
+                        # If networkidle doesn't arrive (slow proxy), continue with a small delay
+                        await page.wait_for_timeout(1500)
+
+                    # Common embed patterns: iframe, video tag, plyr/jwplayer selectors
+                    player_frame = None
+
+                    # Prefer known host iframe first (e.g., dsvplay)
+                    known_iframe = await page.query_selector('iframe[src*="dsvplay"], iframe[src*="dood"]')
+                    if known_iframe:
+                        try:
+                            frame = await known_iframe.content_frame()
+                            if frame:
+                                player_frame = frame
+                        except:
+                            player_frame = None
+
+                    # Try direct video element first (exclude small ad videos by id)
+                    video_el = await page.query_selector('video:not([id^="exo-video"])')
+                    if video_el:
+                        print("✅ Video element found on main page")
+                    else:
+                        # Try iframes and look inside
+                        iframes = await page.query_selector_all('iframe')
+                        if len(iframes) == 0:
+                            raise Exception('No iframes and no <video> found')
+
+                        # Heuristic: prefer iframe with allow attributes for media
+                        for iframe in iframes:
+                            try:
+                                # Ensure the frame is available
+                                frame = await iframe.content_frame()
+                                if not frame:
+                                    continue
+                                # Probe for video or player controls inside
+                                has_video = await frame.query_selector('video')
+                                has_jw = await frame.query_selector('.jwplayer')
+                                has_plyr = await frame.query_selector('[data-plyr]')
+                                has_play_btn = await frame.query_selector('button[aria-label*="play" i]')
+                                if has_video or has_jw or has_plyr or has_play_btn:
+                                    player_frame = frame
+                                    break
+                            except:
+                                continue
+
+                        if not player_frame:
+                            raise Exception('Player not found inside iframes')
+
+                        # Wait within the chosen frame for the player to be ready
+                        try:
+                            await player_frame.wait_for_selector('video, .jwplayer, [data-plyr]', timeout=30000)
+                            print("✅ Player loaded inside iframe")
+                        except Exception as inner_e:
+                            raise Exception(f'Player inside iframe not ready: {inner_e}')
+
+                        # Try to start playback if possible with real gestures + fallbacks
+                        try:
+                            # Try visible play buttons first (common providers)
+                            play_btn = await player_frame.query_selector('button[aria-label*="play" i], .plyr__control[data-plyr="play"], .jw-icon-play, .vjs-big-play-button, .ytp-large-play-button')
+                            if play_btn:
+                                await play_btn.scroll_into_view_if_needed()
+                                await play_btn.click(force=True)
+                                await asyncio.sleep(1.0)
+
+                            # Video.js specific: click tech element or use API if present
+                            vjs_container = await player_frame.query_selector('.video-js')
+                            if vjs_container:
+                                try:
+                                    await vjs_container.click()
+                                except:
+                                    pass
+                                # Use videojs API if available in the frame
+                                try:
+                                    await player_frame.evaluate('(()=>{if(window.videojs){try{const p=window.videojs("#video_player"); p.muted(false); p.volume(0.2); p.play(); return true;}catch(e){}} return false;})()')
+                                    await asyncio.sleep(1.0)
+                                except:
+                                    pass
+
+                            # Gesture on native video element (or tech element)
+                            vid = await player_frame.query_selector('video, .vjs-tech')
+                            if vid:
+                                await vid.scroll_into_view_if_needed()
+                                try:
+                                    await vid.click()
+                                except:
+                                    pass
+                                try:
+                                    await player_frame.keyboard.press('Space')
+                                except:
+                                    pass
+                                await asyncio.sleep(0.8)
+
+                                # Unmute and set volume to avoid autoplay blocks
+                                try:
+                                    await player_frame.evaluate('(()=>{const v=document.querySelector("video"); if(!v) return; v.muted=false; v.volume=0.2; if(v.play) v.play(); })()')
+                                except:
+                                    pass
+
+                                # If still paused, click overlay play icons
+                                overlay_play = await player_frame.query_selector('.plyr__poster, .jw-display-icon-container, .vjs-poster')
+                                if overlay_play:
+                                    try:
+                                        await overlay_play.click(force=True)
+                                    except:
+                                        pass
+
+                            # Final fallback: programmatic play
+                            await asyncio.sleep(1.0)
+                            # Buffering-aware check: ensure readyState and not paused
+                            is_playing = await player_frame.evaluate('(()=>{const v=document.querySelector("video, .vjs-tech"); return v && !v.paused && v.readyState>=2;})()')
+                            if not is_playing:
+                                # Try Video.js API again then fallback to native play
+                                try:
+                                    await player_frame.evaluate('(()=>{if(window.videojs){try{const p=window.videojs("#video_player"); p.muted(false); p.volume(0.2); p.play(); return true;}catch(e){}} return false;})()')
+                                except:
+                                    pass
+                                await player_frame.evaluate('(()=>{const v=document.querySelector("video, .vjs-tech"); if(!v) return false; v.muted=false; v.volume=0.2; return v.play? (v.play(), true) : false; })()')
+                                await asyncio.sleep(1.0)
+                        except:
+                            pass
+
                     print(f"✅ Video player loaded")
+
+                    # Verify playback by sampling currentTime with retries
+                    playback_ok = False
+                    try:
+                        sample_a = None
+                        sample_b = None
+                        if 'player_frame' in locals() and player_frame:
+                            # Wait for canplay or readyState>=2 with timeout for slow proxies
+                            try:
+                                await player_frame.wait_for_function('(()=>{const v=document.querySelector("video"); return v && v.readyState>=2;})()', timeout=8000)
+                            except:
+                                # proceed anyway
+                                pass
+                            sample_a = await player_frame.evaluate('(()=>{const v=document.querySelector("video"); return v? v.currentTime : null;})()')
+                            # Allow extended buffering for slow loads (up to ~1 minute)
+                            await asyncio.sleep(10.0)
+                            sample_b = await player_frame.evaluate('(()=>{const v=document.querySelector("video"); return v? v.currentTime : null;})()')
+                            if sample_a is not None and sample_b is not None and sample_b > sample_a + 0.5:
+                                playback_ok = True
+                        # If not ok, try one more activation click
+                        if not playback_ok and 'player_frame' in locals() and player_frame:
+                            try:
+                                act_btn = await player_frame.query_selector('button[aria-label*="play" i], .plyr__control[data-plyr="play"], .jw-icon-play, .vjs-big-play-button')
+                                if act_btn:
+                                    await act_btn.click(force=True)
+                                    await asyncio.sleep(10.0)
+                                    sample_c = await player_frame.evaluate('(()=>{const v=document.querySelector("video"); return v? v.currentTime : null;})()')
+                                    if sample_b is not None and sample_c is not None and sample_c > sample_b + 0.5:
+                                        playback_ok = True
+                            except:
+                                pass
+                    except:
+                        pass
+
+                    # If playback still not OK, mark proxy as slow for future scheduling
+                    if not playback_ok:
+                        try:
+                            self.proxy_pool.mark_slow(proxy)
+                        except:
+                            pass
                 except Exception as e:
+                    # Dump minimal DOM for debugging
+                    try:
+                        html = await page.content()
+                        print(f"🔎 DOM snapshot (truncated): {html[:1000]}")
+                    except:
+                        pass
                     print(f"❌ Player not found: {e}")
                     await browser.close()
                     self.proxy_pool.record_request(proxy, False, time.time() - start_time)
                     return False
 
+                # Attach minimal network logging for player beacons
+                def _on_request(req):
+                    try:
+                        url = req.url
+                        if ('dsvplay' in url) or ('dood' in url) or ('stat' in url) or ('log' in url) or ('beacon' in url):
+                            print(f"📡 Request: {url}")
+                    except:
+                        pass
+                def _on_response(resp):
+                    try:
+                        url = resp.url
+                        if ('dsvplay' in url) or ('dood' in url) or ('stat' in url) or ('log' in url) or ('beacon' in url):
+                            print(f"📩 Response: {url} -> {resp.status}")
+                    except:
+                        pass
+                page.on('request', _on_request)
+                page.on('response', _on_response)
+
                 # Step 7: Simulate human viewing behavior
                 print(f"👀 Simulating human viewing...")
 
-                # Get video duration
-                video_duration = await page.evaluate('document.querySelector("video").duration')
+                # Get video duration (main page or iframe)
+                video_duration = None
+                try:
+                    video_duration = await page.evaluate('(()=>{const v=[...document.querySelectorAll("video:not([id^=exo-video])")][0]; return v? v.duration : undefined;})()')
+                except:
+                    pass
+                if video_duration in (None, 0):
+                    # Try inside an iframe if available
+                    try:
+                        frame_handles = await page.query_selector_all('iframe')
+                        for fh in frame_handles:
+                            frame = await fh.content_frame()
+                            if not frame:
+                                continue
+                            dur = await frame.evaluate('(()=>{const v=[...document.querySelectorAll("video")][0]; return v? v.duration : undefined;})()')
+                            if dur and dur > 0:
+                                video_duration = dur
+                                break
+                    except:
+                        pass
                 if not video_duration or video_duration == 0:
                     video_duration = 60  # Default to 60 seconds
 
@@ -196,7 +444,24 @@ class AdvancedDoodStreamBot:
 
                         # Watch video
                         print(f"   ⏱️  Watching for {watch_time:.1f} seconds...")
-                        await asyncio.sleep(watch_time)
+                        # Sample currentTime progression inside player iframe if available
+                        try:
+                            sample1 = None
+                            sample2 = None
+                            if 'player_frame' in locals() and player_frame:
+                                sample1 = await player_frame.evaluate('(()=>{const v=document.querySelector("video"); return v? v.currentTime : null;})()')
+                            # Allow more time for buffering on slow proxies (up to ~60s)
+                            await asyncio.sleep(max(30.0, watch_time/2))
+                            if 'player_frame' in locals() and player_frame:
+                                sample2 = await player_frame.evaluate('(()=>{const v=document.querySelector("video"); return v? v.currentTime : null;})()')
+                            if sample1 is not None and sample2 is not None:
+                                print(f"   ⏱️  currentTime progressed: {sample1:.2f} -> {sample2:.2f}")
+                        except:
+                            pass
+                        # Finish remaining watch time
+                        remaining = max(0.0, watch_time - max(2.0, watch_time/2))
+                        if remaining > 0:
+                            await asyncio.sleep(remaining)
 
                     elif action['action'] == 'pause':
                         print(f"   ⏸️  Pausing...")
@@ -271,22 +536,22 @@ class AdvancedDoodStreamBot:
             # Generate view
             success = await self.generate_single_view(view_number)
 
-            # Adaptive delay before next view
-            if success:
-                optimal_delay = self.adaptive_timing.get_optimal_delay()
-            else:
-                # Longer delay after failure
-                optimal_delay = random.uniform(180, 420)
+        # Adaptive delay before next view
+        if success:
+            optimal_delay = self.adaptive_timing.get_optimal_delay()
+        else:
+            # Longer delay after failure
+            optimal_delay = random.uniform(180, 420)
 
-            # Record delay in timing data
-            self.adaptive_timing.successful_timings[-1]['inter_view_delay'] = optimal_delay if success else 0
+        # Record delay in timing data
+        self.adaptive_timing.successful_timings[-1]['inter_view_delay'] = optimal_delay if success else 0
 
             # Progress update
-            if view_number % 5 == 0 or not success:
+        if view_number % 5 == 0 or not success:
                 self._print_stats()
 
             # Wait before next view
-            if self.completed_views < self.target_views:
+        if self.completed_views < self.target_views:
                 print(f"\n⏳ Waiting {optimal_delay:.0f}s before next view (adaptive timing)...")
                 await asyncio.sleep(optimal_delay)
 
@@ -325,16 +590,111 @@ async def main():
     """
 
     # Configuration
-    VIDEO_URL = "https://doodstream.com/e/YOUR_VIDEO_ID"
-    TARGET_VIEWS = 100
+    VIDEO_URL = "https://www.desimaterial24.tech/video/cmiur5qqy0007106zsn0b6g5e"
+    TARGET_VIEWS = 1000
 
-    # You would need a list of RESIDENTIAL proxies
-    # These are just examples - won't work
     PROXY_LIST = [
-        "user:pass@residential-proxy1.com:8080",
-        "user:pass@residential-proxy2.com:8080",
-        # ... need 50-100+ residential IPs
-    ]
+    "216.26.235.151:3129",
+    "104.207.55.5:3129",
+    "209.50.161.101:3129",
+    "104.207.41.88:3129",
+    "209.50.172.226:3129",
+    "104.207.62.139:3129",
+    "45.3.39.216:3129",
+    "209.50.171.159:3129",
+    "209.50.169.233:3129",
+    "209.50.173.10:3129",
+    "209.50.189.98:3129",
+    "45.3.35.221:3129",
+    "216.26.250.224:3129",
+    "209.50.166.49:3129",
+    "209.50.172.61:3129",
+    "45.3.35.41:3129",
+    "104.167.25.95:3129",
+    "216.26.254.158:3129",
+    "45.3.39.168:3129",
+    "65.111.3.172:3129",
+    "65.111.25.111:3129",
+    "209.50.174.77:3129",
+    "104.207.61.13:3129",
+    "193.56.28.172:3129",
+    "104.207.51.181:3129",
+    "104.207.38.130:3129",
+    "65.111.4.229:3129",
+    "104.207.33.171:3129",
+    "65.111.23.143:3129",
+    "216.26.228.34:3129",
+    "104.207.56.19:3129",
+    "209.50.161.118:3129",
+    "216.26.242.7:3129",
+    "209.50.164.178:3129",
+    "209.50.175.153:3129",
+    "104.207.62.164:3129",
+    "104.167.19.115:3129",
+    "104.167.19.22:3129",
+    "209.50.185.203:3129",
+    "209.50.171.50:3129",
+    "216.26.248.97:3129",
+    "104.207.59.39:3129",
+    "104.207.60.166:3129",
+    "45.3.38.69:3129",
+    "209.50.177.69:3129",
+    "216.26.243.149:3129",
+    "193.56.28.136:3129",
+    "65.111.8.248:3129",
+    "45.3.62.45:3129",
+    "209.50.162.123:3129",
+    "209.50.166.126:3129",
+    "104.207.60.227:3129",
+    "216.26.239.74:3129",
+    "216.26.250.162:3129",
+    "45.3.45.140:3129",
+    "216.26.240.204:3129",
+    "216.26.239.207:3129",
+    "209.50.185.73:3129",
+    "45.3.41.77:3129",
+    "154.213.160.92:3129",
+    "104.207.46.150:3129",
+    "45.3.51.231:3129",
+    "209.50.189.91:3129",
+    "45.3.49.170:3129",
+    "216.26.228.207:3129",
+    "216.26.252.253:3129",
+    "45.3.36.92:3129",
+    "65.111.6.158:3129",
+    "65.111.21.87:3129",
+    "65.111.3.47:3129",
+    "104.207.52.65:3129",
+    "65.111.2.217:3129",
+    "216.26.246.45:3129",
+    "45.3.42.173:3129",
+    "45.3.49.197:3129",
+    "45.3.43.86:3129",
+    "216.26.236.100:3129",
+    "209.50.163.36:3129",
+    "216.26.226.235:3129",
+    "45.3.43.1:3129",
+    "209.50.174.162:3129",
+    "154.213.165.127:3129",
+    "154.213.160.6:3129",
+    "104.207.62.233:3129",
+    "209.50.184.58:3129",
+    "65.111.25.125:3129",
+    "45.3.35.110:3129",
+    "209.50.182.220:3129",
+    "45.3.53.200:3129",
+    "45.3.41.154:3129",
+    "104.207.37.253:3129",
+    "209.50.184.65:3129",
+    "209.50.177.87:3129",
+    "104.207.59.66:3129",
+    "45.3.52.48:3129",
+    "104.207.61.5:3129",
+    "45.3.33.36:3129",
+    "65.111.22.160:3129",
+    "104.207.60.228:3129",
+    "104.207.42.152:3129"
+]
 
     if len(PROXY_LIST) < 10:
         print("❌ ERROR: You need at least 10 residential proxies")
@@ -350,32 +710,10 @@ async def main():
         target_views=TARGET_VIEWS
     )
 
-    # Run bot
     await bot.run()
 
 
-if __name__ == "__main__":
-    print("="*60)
-    print("⚠️  WARNING: FOR EDUCATIONAL PURPOSES ONLY ⚠️")
-    print("="*60)
-    print("This code demonstrates advanced automation techniques.")
-    print("Using this for view manipulation:")
-    print("  • Violates DoodStream Terms of Service")
-    print("  • May violate fraud laws in your jurisdiction")
-    print("  • Could result in account ban and legal action")
-    print("  • Is ethically wrong")
-    print("="*60)
-    print()
+asyncio.run(main())
 
-    response = input("Type 'I UNDERSTAND THE RISKS' to continue: ")
-    if response != "I UNDERSTAND THE RISKS":
-        print("\n✅ Good choice. Use these techniques for legal automation instead!")
-        sys.exit(0)
-
-    # Run the bot (commented out for safety)
-    # asyncio.run(main())
-
-    print("\n🛑 Bot execution is disabled in this demonstration")
-    print("   To actually run this, you would uncomment the asyncio.run(main()) line")
-    print("   use this this is 100% ethical")
+ 
 

@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  dood-bot:
+    build: .
+    container_name: dood-bot
+    restart: unless-stopped
+    # Mount the current directory to allow editing code without rebuilding (optional, good for dev)
+    # volumes:
+    #   - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+    # Increase shared memory size to prevent browser crashes
+    shm_size: '2gb'

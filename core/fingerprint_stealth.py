@@ -1,8 +1,3 @@
-        """
-Military-Grade Fingerprint Evasion
-Goes far beyond basic randomization
-"""
-
 import random
 import hashlib
 import json
@@ -149,7 +144,7 @@ class FingerprintStealth:
         return random.choice(resolutions)
 
     def _generate_os_details(self, os_type: str) -> Dict:
-        """Generate realistic OS version and details"""
+        """Generate realistic OS version and details with a consistent user_agent_string"""
         if os_type == 'windows':
             versions = ['10.0', '11.0']
             version = random.choice(versions)
@@ -175,8 +170,30 @@ class FingerprintStealth:
                 'platform': 'Linux x86_64',
                 'user_agent_string': 'X11; Linux x86_64'
             }
+        elif os_type == 'android':
+            version = random.choice(['11', '12', '13'])
+            return {
+                'name': 'Android',
+                'version': version,
+                'platform': 'Linux armv8l',
+                'user_agent_string': f'Linux; Android {version}; Pixel 6'
+            }
+        elif os_type == 'ios':
+            version = random.choice(['15_7', '16_4', '17_0'])
+            return {
+                'name': 'iOS',
+                'version': version.replace('_', '.'),
+                'platform': 'iPhone',
+                'user_agent_string': f'iPhone; CPU iPhone OS {version} like Mac OS X'
+            }
         else:
-            return {'name': os_type, 'version': 'unknown', 'platform': 'unknown'}
+            # Fallback ensures required keys exist
+            return {
+                'name': os_type,
+                'version': 'unknown',
+                'platform': 'unknown',
+                'user_agent_string': os_type
+            }
 
     def _generate_browser_details(self, browser: str, os_type: str) -> Dict:
         """Generate realistic browser version"""
